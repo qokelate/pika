@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"runtime/debug"
+
 	"github.com/gorilla/websocket"
 	"github.com/pika-monitor/pika/internal/protocol"
 	"go.uber.org/zap"
@@ -188,6 +190,7 @@ func (c *Client) trySend(message []byte) bool {
 // Manager 同步维护当前连接和每个 agent 的会话状态。
 type Manager struct {
 	mu       sync.RWMutex
+	statusMu sync.Map // agentID → *sync.Mutex，串行化在线状态写库
 	clients  map[string]*Client
 	sessions map[string]*agentSession
 
@@ -273,8 +276,14 @@ func (m *Manager) Register(client *Client, bootID string) uint64 {
 	return ackSeq
 }
 
-// Unregister 只移除仍为 current 的连接，返回值用于决定是否标记离线。
-func (m *Manager) Unregister(client *Client) bool {
+func (m *Manager) lockAgentStatus(agentID string) func() {
+	v, _ := m.statusMu.LoadOrStore(agentID, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+func (m *Manager) unregisterLocked(client *Client) bool {
 	m.mu.Lock()
 	current := m.clients[client.ID] == client
 	if current {
@@ -292,8 +301,29 @@ func (m *Manager) Unregister(client *Client) bool {
 	return current
 }
 
+// Unregister 只移除仍为 current 的连接，返回值用于决定是否标记离线。
+func (m *Manager) Unregister(client *Client) bool {
+	unlock := m.lockAgentStatus(client.ID)
+	defer unlock()
+	return m.unregisterLocked(client)
+}
+
+// UnregisterThen 在状态锁内完成注销和回调，避免离线写库与 pong/新连接在线写库交错。
+func (m *Manager) UnregisterThen(client *Client, fn func()) bool {
+	unlock := m.lockAgentStatus(client.ID)
+	defer unlock()
+	current := m.unregisterLocked(client)
+	if current && fn != nil {
+		fn()
+	}
+	return current
+}
+
 // ForgetAgent 删除已移除 agent 的连接与会话状态，终止常驻 worker。
 func (m *Manager) ForgetAgent(agentID string) {
+	unlock := m.lockAgentStatus(agentID)
+	defer unlock()
+
 	m.mu.Lock()
 	client := m.clients[agentID]
 	session := m.sessions[agentID]
@@ -382,6 +412,19 @@ func (m *Manager) SendToClient(agentID string, message []byte) error {
 	return client.sendWithTimeout(message, serverSendWait)
 }
 
+func (m *Manager) TrySendToClient(agentID string, message []byte) error {
+	m.mu.RLock()
+	client := m.clients[agentID]
+	m.mu.RUnlock()
+	if client == nil {
+		return ErrClientNotFound
+	}
+	if !client.trySend(message) {
+		return ErrQueueFull
+	}
+	return nil
+}
+
 func (m *Manager) GetClient(agentID string) (*Client, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -389,13 +432,16 @@ func (m *Manager) GetClient(agentID string) (*Client, bool) {
 	return client, ok
 }
 
-// DoIfCurrent 在连接仍为 current 的前提下执行状态变更，并用注册锁保证
-// 回调完成前不会切换连接。用于 pong 在线写库，避免旧连接的迟到写入覆盖
-// 新连接失败后的离线状态。
+// DoIfCurrent 在连接仍为 current 的前提下执行状态变更。
+// 使用 per-agent 状态锁，避免持有连接表锁做 IO，同时保证 pong 写库
+// 与 Unregister 离线写库互斥。
 func (m *Manager) DoIfCurrent(client *Client, fn func() error) (bool, error) {
+	unlock := m.lockAgentStatus(client.ID)
+	defer unlock()
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.clients[client.ID] != client {
+	current := m.clients[client.ID] == client
+	m.mu.RUnlock()
+	if !current {
 		return false, nil
 	}
 	return true, fn()
@@ -532,14 +578,29 @@ func (m *Manager) bestEffortProcessLoop(session *agentSession) {
 			if session.ctx.Err() != nil || !m.isCurrentSession(session) {
 				return
 			}
-			if m.onMessage == nil {
-				continue
-			}
-			if err := m.onMessage(session.ctx, session.agentID, msg.typ, msg.data); err != nil {
-				m.logger.Error("failed to handle best-effort message, dropped",
-					zap.Error(err), zap.String("agentID", session.agentID), zap.String("type", msg.typ))
-			}
+			m.handleBestEffort(session, msg)
 		}
+	}
+}
+
+func (m *Manager) handleBestEffort(session *agentSession, msg agentMessage) {
+	defer func() {
+		if r := recover(); r != nil {
+			m.logger.Error("best-effort handler panic",
+				zap.Any("panic", r),
+				zap.ByteString("stack", debug.Stack()),
+				zap.String("agentID", session.agentID),
+				zap.String("type", msg.typ))
+		}
+	}()
+	if m.onMessage == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(session.ctx, 10*time.Second)
+	defer cancel()
+	if err := m.onMessage(ctx, session.agentID, msg.typ, msg.data); err != nil {
+		m.logger.Error("failed to handle best-effort message, dropped",
+			zap.Error(err), zap.String("agentID", session.agentID), zap.String("type", msg.typ))
 	}
 }
 
@@ -571,7 +632,19 @@ func (m *Manager) reliableProcessLoop(session *agentSession) {
 
 // processReliableMessage 对瞬时错误原位退避重试，保证后续序号不能越过
 // 失败消息；永久格式错误明确丢弃并允许推进位点。
-func (m *Manager) processReliableMessage(session *agentSession, msg agentMessage) bool {
+func (m *Manager) processReliableMessage(session *agentSession, msg agentMessage) (ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			m.logger.Error("reliable handler panic, dropped",
+				zap.Any("panic", r),
+				zap.ByteString("stack", debug.Stack()),
+				zap.String("agentID", session.agentID),
+				zap.String("type", msg.typ),
+				zap.Uint64("seq", msg.seq))
+			ok = true
+		}
+	}()
+
 	retryDelay := messageRetryMin
 	for {
 		if session.ctx.Err() != nil || !m.isCurrentSession(session) {
@@ -581,7 +654,9 @@ func (m *Manager) processReliableMessage(session *agentSession, msg agentMessage
 			return true
 		}
 
-		err := m.onMessage(session.ctx, session.agentID, msg.typ, msg.data)
+		ctx, cancel := context.WithTimeout(session.ctx, 15*time.Second)
+		err := m.onMessage(ctx, session.agentID, msg.typ, msg.data)
+		cancel()
 		if err == nil {
 			return true
 		}

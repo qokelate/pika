@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-orz/toolkit/syncx"
 	"github.com/pika-monitor/pika/internal/metric"
+	"github.com/pika-monitor/pika/internal/models"
 	"github.com/pika-monitor/pika/internal/protocol"
 	"github.com/pika-monitor/pika/internal/repo"
 	"github.com/pika-monitor/pika/internal/vmclient"
@@ -36,6 +37,7 @@ type MetricService struct {
 	latestCache cache.Cache[string, *metric.LatestMetrics] // Agent 最新指标缓存
 
 	monitorLatestCache cache.Cache[string, *metric.LatestMonitorMetrics] // 监控最新指标缓存
+	monitorCacheMu     syncx.KeyedMutex
 
 	monitorSparklineMu       sync.Mutex
 	monitorSparklineCache    map[string]monitorSparklineCacheEntry
@@ -52,7 +54,7 @@ func NewMetricService(logger *zap.Logger, db *gorm.DB, propertyService *Property
 		trafficService:           trafficService,
 		vmClient:                 vmClient,
 		latestCache:              cache.New[string, *metric.LatestMetrics](time.Minute),
-		monitorLatestCache:       cache.New[string, *metric.LatestMonitorMetrics](5 * time.Minute), // 监控数据缓存 5 分钟
+		monitorLatestCache:       cache.New[string, *metric.LatestMonitorMetrics](30 * time.Minute),
 		monitorSparklineCache:    make(map[string]monitorSparklineCacheEntry),
 		monitorSparklineInflight: make(map[string]*monitorSparklineCall),
 	}
@@ -354,13 +356,11 @@ func (s *MetricService) HandleMetricData(ctx context.Context, agentID string, me
 		}
 		for i := range monitorDataList {
 			monitorDataList[i].AgentId = agentID // 关联探针ID
+			s.updateMonitorCache(agentID, monitorDataList[i], timestamp)
 		}
 		latestMetrics.Update(func(lm *metric.LatestMetrics) {
 			lm.Monitors = monitorDataList
 		})
-		for _, monitorData := range monitorDataList {
-			s.updateMonitorCache(agentID, &monitorData, timestamp)
-		}
 
 		metrics := s.convertToMetrics(agentID, metricType, monitorDataList, timestamp)
 		return s.vmClient.Write(ctx, metrics)
@@ -471,13 +471,10 @@ func (s *MetricService) CleanMonitorCache(ctx context.Context, monitorID string)
 		return err
 	}
 
-	// 只在有过滤条件时清理缓存
 	if !targetSet.all {
-		// 遍历缓存中的探针，移除不再关联的探针数据
-		for agentId := range latestMetrics.Agents.Keys() {
+		for _, agentId := range latestMetrics.AgentIDs() {
 			if !targetSet.Contains(agentId) {
-				// 该探针已不再关联到此监控任务，从缓存中移除
-				latestMetrics.Agents.Delete(agentId)
+				latestMetrics.DeleteAgent(agentId)
 				s.logger.Debug("从监控缓存中移除探针",
 					zap.String("monitorID", monitorID),
 					zap.String("agentID", agentId))
@@ -500,8 +497,7 @@ func (s *MetricService) CleanAgentFromMonitorCache(agentID string) {
 			continue
 		}
 
-		// 从该监控缓存中删除指定探针的数据
-		latestMetrics.Agents.Delete(agentID)
+		latestMetrics.DeleteAgent(agentID)
 		s.logger.Debug("从监控缓存中移除探针数据",
 			zap.String("monitorID", monitorID),
 			zap.String("agentID", agentID))
@@ -517,24 +513,21 @@ func (s *MetricService) DeleteAgentLatestMetricsCache(agentID string) {
 }
 
 // updateMonitorCache 更新监控数据缓存
-func (s *MetricService) updateMonitorCache(agentID string, monitorData *protocol.MonitorData, timestamp int64) {
+func (s *MetricService) updateMonitorCache(agentID string, monitorData protocol.MonitorData, timestamp int64) {
 	monitorID := monitorData.MonitorId
-
-	// 获取或创建监控缓存
-	latestMetrics, ok := s.monitorLatestCache.Get(monitorID)
-	if !ok {
-		latestMetrics = &metric.LatestMonitorMetrics{
-			MonitorID: monitorID,
-			Agents:    syncx.NewSafeMap[string, *protocol.MonitorData](),
-		}
+	if monitorID == "" {
+		return
 	}
 
-	// 更新探针数据
-	latestMetrics.Agents.Set(agentID, monitorData)
-	latestMetrics.UpdatedAt = timestamp
+	unlock := s.monitorCacheMu.Lock(monitorID)
+	defer unlock()
 
-	// 保存到缓存（5分钟过期）
-	s.monitorLatestCache.Set(monitorID, latestMetrics, 5*time.Minute)
+	latestMetrics, ok := s.monitorLatestCache.Get(monitorID)
+	if !ok || latestMetrics == nil {
+		latestMetrics = metric.NewLatestMonitorMetrics(monitorID)
+	}
+	latestMetrics.SetAgent(agentID, monitorData, timestamp)
+	s.monitorLatestCache.Set(monitorID, latestMetrics, 30*time.Minute)
 }
 
 // GetLatestMetrics 获取最新指标的快照
@@ -1134,104 +1127,93 @@ func (s *MetricService) GetMonitorHistory(ctx context.Context, monitorID string,
 
 // GetMonitorAgentStats 获取监控任务各探针的统计数据（只从缓存读取）
 func (s *MetricService) GetMonitorAgentStats(ctx context.Context, monitorID string) []protocol.MonitorData {
-	// 从缓存读取监控数据
-	latestMetrics, ok := s.monitorLatestCache.Get(monitorID)
-	if !ok {
-		// 缓存不存在，返回空列表
-		return []protocol.MonitorData{}
-	}
-
-	// 查询监控任务配置
 	monitorTask, err := s.monitorRepo.FindById(ctx, monitorID)
 	if err != nil {
 		s.logger.Error("查询监控任务失败", zap.String("monitorID", monitorID), zap.Error(err))
 		return []protocol.MonitorData{}
 	}
+	return s.GetMonitorAgentStatsForTask(ctx, &monitorTask)
+}
 
-	// 解析目标探针集合（指定探针与标签匹配探针的并集，均未指定时对所有探针生效）
-	targetSet, err := resolveMonitorTargetSet(ctx, s.agentRepo, &monitorTask)
-	if err != nil {
-		s.logger.Error("解析监控目标探针失败", zap.String("monitorID", monitorID), zap.Error(err))
+func (s *MetricService) GetMonitorAgentStatsForTask(ctx context.Context, monitorTask *models.MonitorTask) []protocol.MonitorData {
+	if monitorTask == nil {
+		return []protocol.MonitorData{}
+	}
+	latestMetrics, ok := s.monitorLatestCache.Get(monitorTask.ID)
+	if !ok || latestMetrics == nil {
 		return []protocol.MonitorData{}
 	}
 
-	// 收集所有当前关联的 agentId（从缓存中过滤）
-	agentIds := make([]string, 0)
-	for agentId := range latestMetrics.Agents.Keys() {
-		if targetSet.Contains(agentId) {
-			agentIds = append(agentIds, agentId)
+	targetSet, err := resolveMonitorTargetSet(ctx, s.agentRepo, monitorTask)
+	if err != nil {
+		s.logger.Error("解析监控目标探针失败", zap.String("monitorID", monitorTask.ID), zap.Error(err))
+		return []protocol.MonitorData{}
+	}
+
+	snapshot := latestMetrics.Snapshot()
+	agentIds := make([]string, 0, len(snapshot))
+	for _, stat := range snapshot {
+		if targetSet.Contains(stat.AgentId) {
+			agentIds = append(agentIds, stat.AgentId)
 		}
 	}
 
-	// 查询 agent 信息
 	agents, err := s.agentRepo.FindByIdIn(ctx, agentIds)
 	if err != nil {
 		s.logger.Error("查询 agent 信息失败", zap.Error(err))
 	}
-
-	// 构建 agentId -> agentName 映射
-	agentNameMap := make(map[string]string)
+	agentNameMap := make(map[string]string, len(agents))
 	for _, agent := range agents {
 		agentNameMap[agent.ID] = agent.Name
 	}
 
-	// 转换为数组并填充 agent 名称
 	result := make([]protocol.MonitorData, 0, len(agentIds))
-	for stat := range latestMetrics.Agents.Values() {
-		// 只返回目标集合内的 agent 数据
-		if targetSet.Contains(stat.AgentId) {
-			stat.AgentName = agentNameMap[stat.AgentId] // 填充 agent 名称
-			result = append(result, *stat)
+	for _, stat := range snapshot {
+		if !targetSet.Contains(stat.AgentId) {
+			continue
 		}
+		stat.AgentName = agentNameMap[stat.AgentId]
+		result = append(result, stat)
 	}
-	// 根据响应时间排序
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].ResponseTime < result[j].ResponseTime
 	})
-
 	return result
 }
 
 // GetMonitorStats 获取监控任务的聚合统计数据（只从缓存读取）
 func (s *MetricService) GetMonitorStats(ctx context.Context, monitorID string) *metric.MonitorStatsResult {
-	// 从缓存读取监控数据
-	latestMetrics, ok := s.monitorLatestCache.Get(monitorID)
-	if !ok {
-		// 缓存不存在，返回默认值
-		return &metric.MonitorStatsResult{
-			Status: "unknown",
-		}
-	}
-
-	// 查询监控任务配置
 	monitorTask, err := s.monitorRepo.FindById(ctx, monitorID)
 	if err != nil {
 		s.logger.Error("查询监控任务失败", zap.String("monitorID", monitorID), zap.Error(err))
-		return &metric.MonitorStatsResult{
-			Status: "unknown",
-		}
+		return &metric.MonitorStatsResult{Status: "unknown"}
 	}
-
-	// 解析目标探针集合（指定探针与标签匹配探针的并集，均未指定时对所有探针生效）
-	targetSet, err := resolveMonitorTargetSet(ctx, s.agentRepo, &monitorTask)
-	if err != nil {
-		s.logger.Error("解析监控目标探针失败", zap.String("monitorID", monitorID), zap.Error(err))
-		return &metric.MonitorStatsResult{
-			Status: "unknown",
-		}
-	}
-
-	// 聚合各探针数据
-	return s.aggregateMonitorStats(latestMetrics, targetSet)
+	return s.GetMonitorStatsForTask(ctx, &monitorTask)
 }
 
-// aggregateMonitorStats 聚合各探针的监控数据
-func (s *MetricService) aggregateMonitorStats(latestMetrics *metric.LatestMonitorMetrics, targetSet monitorTargetSet) *metric.MonitorStatsResult {
+func (s *MetricService) GetMonitorStatsForTask(ctx context.Context, monitorTask *models.MonitorTask) *metric.MonitorStatsResult {
+	if monitorTask == nil {
+		return &metric.MonitorStatsResult{Status: "unknown"}
+	}
+	latestMetrics, ok := s.monitorLatestCache.Get(monitorTask.ID)
+	if !ok || latestMetrics == nil {
+		return &metric.MonitorStatsResult{Status: "unknown"}
+	}
+
+	targetSet, err := resolveMonitorTargetSet(ctx, s.agentRepo, monitorTask)
+	if err != nil {
+		s.logger.Error("解析监控目标探针失败", zap.String("monitorID", monitorTask.ID), zap.Error(err))
+		return &metric.MonitorStatsResult{Status: "unknown"}
+	}
+	return s.aggregateMonitorStats(latestMetrics.Snapshot(), targetSet)
+}
+
+func (s *MetricService) aggregateMonitorStats(stats []protocol.MonitorData, targetSet monitorTargetSet) *metric.MonitorStatsResult {
 	result := &metric.MonitorStatsResult{
 		Status: "unknown",
 	}
 
-	if latestMetrics.Agents.Len() == 0 {
+	if len(stats) == 0 {
 		return result
 	}
 
@@ -1245,8 +1227,8 @@ func (s *MetricService) aggregateMonitorStats(latestMetrics *metric.LatestMonito
 	var minCertExpiryTime int64
 	var minCertDaysLeft int
 
-	for stat := range latestMetrics.Agents.Values() {
-		// 只聚合目标集合内的探针数据
+	for i := range stats {
+		stat := &stats[i]
 		if !targetSet.Contains(stat.AgentId) {
 			continue
 		}

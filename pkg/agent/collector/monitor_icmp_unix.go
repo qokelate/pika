@@ -3,12 +3,28 @@
 package collector
 
 import (
+	"context"
 	"time"
 
 	probing "github.com/prometheus-community/pro-bing"
 )
 
-func pingHost(target string, count, timeoutSec int) (*pingStats, error) {
+func pingHost(ctx context.Context, target string, count, timeoutSec int) (*pingStats, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	stats, err := runPinger(ctx, target, count, timeoutSec, false)
+	if err == nil {
+		return stats, nil
+	}
+	if ctx.Err() != nil {
+		return nil, err
+	}
+	return runPinger(ctx, target, count, timeoutSec, true)
+}
+
+func runPinger(ctx context.Context, target string, count, timeoutSec int, privileged bool) (*pingStats, error) {
 	pinger, err := probing.NewPinger(target)
 	if err != nil {
 		return nil, err
@@ -16,15 +32,11 @@ func pingHost(target string, count, timeoutSec int) (*pingStats, error) {
 
 	pinger.Count = count
 	pinger.Timeout = time.Duration(timeoutSec) * time.Second
-	pinger.Interval = 100 * time.Millisecond
-	pinger.SetPrivileged(false)
+	pinger.Interval = 200 * time.Millisecond
+	pinger.SetPrivileged(privileged)
 
-	if err := pinger.Run(); err != nil {
-		// 非特权 UDP ICMP 不可用时回退到 raw socket（需要 root / CAP_NET_RAW）
-		pinger.SetPrivileged(true)
-		if err := pinger.Run(); err != nil {
-			return nil, err
-		}
+	if err := pinger.RunWithContext(ctx); err != nil {
+		return nil, err
 	}
 
 	s := pinger.Statistics()

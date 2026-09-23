@@ -1,15 +1,70 @@
 package metric
 
 import (
-	"github.com/go-orz/toolkit/syncx"
+	"sync"
+
 	"github.com/pika-monitor/pika/internal/protocol"
 )
 
-// LatestMonitorMetrics 监控任务的最新指标（按 agent 分组）
+// LatestMonitorMetrics 监控任务的最新指标（按 agent 分组）。
+// 内部 map 只在持锁时访问，Snapshot/AgentIDs 返回拷贝，避免与上报路径并发迭代。
 type LatestMonitorMetrics struct {
-	MonitorID string                                        `json:"monitorId"`
-	Agents    *syncx.SafeMap[string, *protocol.MonitorData] `json:"agents"`    // key: agentID
-	UpdatedAt int64                                         `json:"updatedAt"` // 最后更新时间
+	mu        sync.RWMutex
+	MonitorID string
+	agents    map[string]protocol.MonitorData
+	UpdatedAt int64
+}
+
+func NewLatestMonitorMetrics(monitorID string) *LatestMonitorMetrics {
+	return &LatestMonitorMetrics{
+		MonitorID: monitorID,
+		agents:    make(map[string]protocol.MonitorData),
+	}
+}
+
+func (m *LatestMonitorMetrics) SetAgent(agentID string, data protocol.MonitorData, updatedAt int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.agents == nil {
+		m.agents = make(map[string]protocol.MonitorData)
+	}
+	data.AgentId = agentID
+	m.agents[agentID] = data
+	if updatedAt > m.UpdatedAt {
+		m.UpdatedAt = updatedAt
+	}
+}
+
+func (m *LatestMonitorMetrics) DeleteAgent(agentID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.agents, agentID)
+}
+
+func (m *LatestMonitorMetrics) AgentIDs() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	ids := make([]string, 0, len(m.agents))
+	for id := range m.agents {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func (m *LatestMonitorMetrics) Snapshot() []protocol.MonitorData {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]protocol.MonitorData, 0, len(m.agents))
+	for _, data := range m.agents {
+		out = append(out, data)
+	}
+	return out
+}
+
+func (m *LatestMonitorMetrics) Len() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.agents)
 }
 
 // MonitorStatsResult 监控统计结果（所有探针的聚合数据）

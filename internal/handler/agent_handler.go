@@ -29,6 +29,11 @@ func (h *AgentHandler) updateEnabled(c *echo.Context, enabled bool) error {
 	if err := h.agentService.UpdateAgentEnabled(c.Request().Context(), agentID, enabled); err != nil {
 		return err
 	}
+	if enabled {
+		h.monitorSvc.SyncMonitorConfigToAgent(c.Request().Context(), agentID)
+	} else {
+		h.monitorSvc.ClearMonitorConfig(agentID)
+	}
 	return orz.Ok(c, orz.Map{})
 }
 
@@ -69,9 +74,9 @@ func NewAgentHandler(logger *zap.Logger, agentService *service.AgentService, tra
 
 	// 初始化upgrader，需要在创建handler之后因为需要引用h.checkOrigin
 	h.upgrader = websocket.Upgrader{
-		ReadBufferSize:    1024 * 32,
-		WriteBufferSize:   1024 * 32,
-		EnableCompression: true,
+		ReadBufferSize:    1024 * 8,
+		WriteBufferSize:   1024 * 8,
+		EnableCompression: false,
 	}
 
 	// 设置WebSocket消息处理器

@@ -42,8 +42,56 @@ func (s *metricsStore) put(samples []protocol.MetricSample) {
 	defer s.mu.Unlock()
 
 	for _, sample := range samples {
+		if sample.Type == protocol.MetricTypeMonitor {
+			s.mergeMonitorLocked(sample)
+			continue
+		}
 		s.nextSeq++
 		s.latest[sample.Type] = versionedMetric{sample: sample, seq: s.nextSeq}
+	}
+}
+
+func (s *metricsStore) mergeMonitorLocked(sample protocol.MetricSample) {
+	incoming := monitorDataFromSample(sample)
+	if len(incoming) == 0 {
+		return
+	}
+
+	merged := make(map[string]protocol.MonitorData)
+	if existing, ok := s.latest[protocol.MetricTypeMonitor]; ok {
+		for _, item := range monitorDataFromSample(existing.sample) {
+			if item.MonitorId != "" {
+				merged[item.MonitorId] = item
+			}
+		}
+	}
+	for _, item := range incoming {
+		if item.MonitorId == "" {
+			continue
+		}
+		merged[item.MonitorId] = item
+	}
+
+	items := make([]protocol.MonitorData, 0, len(merged))
+	for _, item := range merged {
+		items = append(items, item)
+	}
+	s.nextSeq++
+	sample.Data = items
+	s.latest[protocol.MetricTypeMonitor] = versionedMetric{sample: sample, seq: s.nextSeq}
+}
+
+func monitorDataFromSample(sample protocol.MetricSample) []protocol.MonitorData {
+	switch data := sample.Data.(type) {
+	case []protocol.MonitorData:
+		return data
+	case *[]protocol.MonitorData:
+		if data == nil {
+			return nil
+		}
+		return *data
+	default:
+		return nil
 	}
 }
 

@@ -20,19 +20,19 @@ var (
 	winPingTimeRe      = regexp.MustCompile(`(?i)[=<]\s*(\d+)\s*ms`)
 )
 
-func pingHost(target string, count, timeoutSec int) (*pingStats, error) {
+func pingHost(ctx context.Context, target string, count, timeoutSec int) (*pingStats, error) {
 	if count <= 0 {
-		count = 4
+		count = 1
 	}
 	if timeoutSec <= 0 {
-		timeoutSec = 5
+		timeoutSec = 3
 	}
 
 	perReplyMs := timeoutSec * 1000
 
 	// 进程级超时取每包超时 × 包数 + 余量；ping 自身在包间还会停 ~1s
 	overall := time.Duration(timeoutSec*count+5) * time.Second
-	ctx, cancel := context.WithTimeout(context.Background(), overall)
+	ctx, cancel := context.WithTimeout(ctx, overall)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "ping",

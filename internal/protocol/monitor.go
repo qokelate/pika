@@ -1,8 +1,12 @@
 package protocol
 
-// MonitorConfigPayload 监控配置 payload
+// MonitorConfigPayload 监控配置 payload。
+// Replace=true 时用 Items 整体替换探针本地任务表；否则按 Items 增改、Removed 删除。
+// Interval 仅作为旧字段兼容：Items 未带 Interval 时回落到该值，仍为 0 则视为一次性检测。
 type MonitorConfigPayload struct {
-	Interval int           `json:"interval"`
+	Replace  bool          `json:"replace,omitempty"`
+	Removed  []string      `json:"removed,omitempty"`
+	Interval int           `json:"interval,omitempty"`
 	Items    []MonitorItem `json:"items"`
 }
 
@@ -11,6 +15,7 @@ type MonitorItem struct {
 	ID         string             `json:"id"`
 	Type       string             `json:"type"`
 	Target     string             `json:"target"`
+	Interval   int                `json:"interval,omitempty"` // 检测间隔（秒），0 表示一次性
 	HTTPConfig *HTTPMonitorConfig `json:"httpConfig,omitempty"`
 	TCPConfig  *TCPMonitorConfig  `json:"tcpConfig,omitempty"`
 	ICMPConfig *ICMPMonitorConfig `json:"icmpConfig,omitempty"`

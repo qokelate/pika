@@ -93,3 +93,38 @@ func TestMetricsStoreAcceptsUpdateAfterClockMovesBackward(t *testing.T) {
 		t.Fatalf("sample collected after clock moved backward was lost: %v", pending)
 	}
 }
+
+func TestMetricsStoreMergesMonitorResultsByID(t *testing.T) {
+	store := newMetricsStore()
+	store.put([]protocol.MetricSample{{
+		Type: protocol.MetricTypeMonitor,
+		Data: []protocol.MonitorData{{MonitorId: "m1", Status: "up", ResponseTime: 10}},
+	}})
+	store.put([]protocol.MetricSample{{
+		Type: protocol.MetricTypeMonitor,
+		Data: []protocol.MonitorData{{MonitorId: "m2", Status: "down", ResponseTime: 20}},
+	}})
+	store.put([]protocol.MetricSample{{
+		Type: protocol.MetricTypeMonitor,
+		Data: []protocol.MonitorData{{MonitorId: "m1", Status: "down", ResponseTime: 30}},
+	}})
+
+	pending, _ := store.pending()
+	if len(pending) != 1 || pending[0].Type != protocol.MetricTypeMonitor {
+		t.Fatalf("pending = %+v", pending)
+	}
+	items, ok := pending[0].Data.([]protocol.MonitorData)
+	if !ok {
+		t.Fatalf("data type %T", pending[0].Data)
+	}
+	got := map[string]protocol.MonitorData{}
+	for _, item := range items {
+		got[item.MonitorId] = item
+	}
+	if got["m1"].Status != "down" || got["m1"].ResponseTime != 30 {
+		t.Fatalf("m1 not updated: %+v", got["m1"])
+	}
+	if got["m2"].Status != "down" {
+		t.Fatalf("m2 lost: %+v", got["m2"])
+	}
+}

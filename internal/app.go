@@ -371,55 +371,62 @@ func startMetricsMonitoring(ctx context.Context, components *AppComponents, logg
 			logger.Info("指标监控任务已停止")
 			return
 		case <-ticker.C:
-			// 检查所有在线探针的最新指标
-			agents, err := components.AgentService.ListOnlineAgents(ctx)
-			if err != nil {
-				logger.Error("获取在线探针失败", zap.Error(err))
-				continue
-			}
-
-			for _, agent := range agents {
-				// 获取最新指标
-				latest, ok := components.MetricService.GetLatestMetrics(agent.ID)
-				if !ok {
-					logger.Debug("获取探针最新指标失败", zap.String("agentId", agent.ID))
-					continue
-				}
-				if latest == nil {
-					logger.Debug("探针最新指标为空", zap.String("agentId", agent.ID))
-					continue
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						logger.Error("指标监控任务 panic", zap.Any("panic", r))
+					}
+				}()
+				// 检查所有在线探针的最新指标
+				agents, err := components.AgentService.ListOnlineAgents(ctx)
+				if err != nil {
+					logger.Error("获取在线探针失败", zap.Error(err))
+					return
 				}
 
-				// 提取 CPU、内存、磁盘使用率、网速
-				var cpuUsage, memoryUsage, diskUsage, networkSpeed float64
+				for _, agent := range agents {
+					// 获取最新指标
+					latest, ok := components.MetricService.GetLatestMetrics(agent.ID)
+					if !ok {
+						logger.Debug("获取探针最新指标失败", zap.String("agentId", agent.ID))
+						continue
+					}
+					if latest == nil {
+						logger.Debug("探针最新指标为空", zap.String("agentId", agent.ID))
+						continue
+					}
 
-				if latest.CPU != nil {
-					cpuUsage = latest.CPU.UsagePercent
+					// 提取 CPU、内存、磁盘使用率、网速
+					var cpuUsage, memoryUsage, diskUsage, networkSpeed float64
+
+					if latest.CPU != nil {
+						cpuUsage = latest.CPU.UsagePercent
+					}
+
+					if latest.Memory != nil {
+						memoryUsage = latest.Memory.UsagePercent
+					}
+
+					if latest.Disk != nil {
+						diskUsage = latest.Disk.UsagePercent
+					}
+
+					if latest.Network != nil {
+						// 网速 = (发送速率 + 接收速率) / 1024 / 1024 (转换为 MB/s)
+						networkSpeed = float64(latest.Network.TotalBytesSentRate+latest.Network.TotalBytesRecvRate) / 1024 / 1024
+					}
+
+					// 检查告警规则
+					if err := components.AlertService.CheckMetrics(ctx, agent.ID, cpuUsage, memoryUsage, diskUsage, networkSpeed); err != nil {
+						logger.Error("检查告警规则失败", zap.String("agentId", agent.ID), zap.Error(err))
+					}
 				}
 
-				if latest.Memory != nil {
-					memoryUsage = latest.Memory.UsagePercent
+				// 检查监控相关告警（证书和服务下线）
+				if err := components.AlertService.CheckMonitorAlerts(ctx); err != nil {
+					logger.Error("检查监控告警失败", zap.Error(err))
 				}
-
-				if latest.Disk != nil {
-					diskUsage = latest.Disk.UsagePercent
-				}
-
-				if latest.Network != nil {
-					// 网速 = (发送速率 + 接收速率) / 1024 / 1024 (转换为 MB/s)
-					networkSpeed = float64(latest.Network.TotalBytesSentRate+latest.Network.TotalBytesRecvRate) / 1024 / 1024
-				}
-
-				// 检查告警规则
-				if err := components.AlertService.CheckMetrics(ctx, agent.ID, cpuUsage, memoryUsage, diskUsage, networkSpeed); err != nil {
-					logger.Error("检查告警规则失败", zap.String("agentId", agent.ID), zap.Error(err))
-				}
-			}
-
-			// 检查监控相关告警（证书和服务下线）
-			if err := components.AlertService.CheckMonitorAlerts(ctx); err != nil {
-				logger.Error("检查监控告警失败", zap.Error(err))
-			}
+			}()
 		}
 	}
 }

@@ -2,8 +2,6 @@ package service
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -107,12 +105,14 @@ func (s *MonitorService) CreateMonitor(ctx context.Context, req *MonitorTaskRequ
 		return nil, err
 	}
 
-	// 如果任务启用，添加到调度器
-	if task.Enabled && s.scheduler != nil {
-		if err := s.scheduler.AddTask(task.ID, task.Interval); err != nil {
-			s.logger.Error("添加监控任务到调度器失败",
-				zap.String("taskID", task.ID),
-				zap.Error(err))
+	if task.Enabled {
+		s.syncAffectedAgents(ctx, *task)
+		if s.scheduler != nil {
+			if err := s.scheduler.AddTask(task.ID, task.Interval); err != nil {
+				s.logger.Error("添加监控任务到调度器失败",
+					zap.String("taskID", task.ID),
+					zap.Error(err))
+			}
 		}
 	}
 
@@ -125,7 +125,7 @@ func (s *MonitorService) UpdateMonitor(ctx context.Context, id string, req *Moni
 		return nil, err
 	}
 
-	// 记录旧状态，用于判断是否需要更新调度器
+	oldTask := cloneMonitorTask(task)
 	oldEnabled := task.Enabled
 	oldInterval := task.Interval
 
@@ -178,7 +178,6 @@ func (s *MonitorService) UpdateMonitor(ctx context.Context, id string, req *Moni
 			// 从调度器中移除任务
 			s.scheduler.RemoveTask(task.ID)
 		} else if task.Enabled && oldInterval != task.Interval {
-			// 更新任务间隔
 			if err := s.scheduler.UpdateTask(task.ID, task.Interval); err != nil {
 				s.logger.Error("更新监控任务调度器失败",
 					zap.String("taskID", task.ID),
@@ -187,27 +186,27 @@ func (s *MonitorService) UpdateMonitor(ctx context.Context, id string, req *Moni
 		}
 	}
 
+	s.syncAffectedAgents(ctx, oldTask, task)
 	return &task, nil
 }
 
 func (s *MonitorService) DeleteMonitor(ctx context.Context, id string) error {
+	task, findErr := s.MonitorRepo.FindById(ctx, id)
 	err := s.Transaction(ctx, func(ctx context.Context) error {
-		// 删除监控任务
-		if err := s.MonitorRepo.DeleteById(ctx, id); err != nil {
-			return err
-		}
-		return nil
+		return s.MonitorRepo.DeleteById(ctx, id)
 	})
-
 	if err != nil {
 		return err
 	}
 
-	// 从调度器中移除
 	if s.scheduler != nil {
 		s.scheduler.RemoveTask(id)
 	}
-
+	if findErr == nil {
+		s.syncAffectedAgents(ctx, task)
+	} else {
+		_ = s.ReconcileMonitorConfigs(ctx)
+	}
 	return nil
 }
 
@@ -223,8 +222,7 @@ func (s *MonitorService) ListByAuth(ctx context.Context, isAuthenticated bool) (
 	items := make([]metric.PublicMonitorOverview, 0, len(monitors))
 	for _, monitor := range monitors {
 		// 查询统计数据
-		stats := s.metricService.GetMonitorStats(ctx, monitor.ID)
-		// 构建监控概览对象
+		stats := s.metricService.GetMonitorStatsForTask(ctx, &monitor)
 		item := s.buildMonitorOverview(monitor, stats)
 		items = append(items, item)
 	}
@@ -287,83 +285,6 @@ func (s *MonitorService) buildMonitorOverview(monitor models.MonitorTask, stats 
 	return overview
 }
 
-// sendMonitorConfigToAgent 向指定探针发送监控配置（内部方法）
-func (s *MonitorService) sendMonitorConfigToAgent(agentID string, payload protocol.MonitorConfigPayload) error {
-	msgData, err := json.Marshal(protocol.OutboundMessage{
-		Type: protocol.MessageTypeMonitorConfig,
-		Data: payload,
-	})
-	if err != nil {
-		return err
-	}
-
-	return s.wsManager.SendToClient(agentID, msgData)
-}
-
-// SendMonitorTaskToAgents 向指定探针发送单个监控任务（公开方法）
-func (s *MonitorService) SendMonitorTaskToAgents(ctx context.Context, monitor models.MonitorTask) error {
-	// 解析目标探针集合（指定探针与标签匹配探针的并集，均未指定时对所有探针生效）
-	targetSet, err := resolveMonitorTargetSet(ctx, s.agentRepo, &monitor)
-	if err != nil {
-		return err
-	}
-
-	var targetAgentIDs []string
-	if targetSet.all {
-		// 没有指定探针和标签，向所有在线探针发送
-		targetAgentIDs = s.wsManager.GetAllClients()
-	} else {
-		for agentID := range targetSet.ids {
-			targetAgentIDs = append(targetAgentIDs, agentID)
-		}
-	}
-
-	if len(targetAgentIDs) == 0 {
-		return nil
-	}
-
-	// 构建监控项
-	item := protocol.MonitorItem{
-		ID:     monitor.ID,
-		Type:   monitor.Type,
-		Target: monitor.Target,
-	}
-
-	if monitor.Type == "http" || monitor.Type == "https" {
-		httpConfig := monitor.HTTPConfig.Data()
-		item.HTTPConfig = &httpConfig
-	} else if monitor.Type == "tcp" {
-		var tcpConfig = monitor.TCPConfig.Data()
-		item.TCPConfig = &tcpConfig
-	} else if monitor.Type == "icmp" || monitor.Type == "ping" {
-		var icmpConfig = monitor.ICMPConfig.Data()
-		item.ICMPConfig = &icmpConfig
-	}
-
-	// 构建 payload
-	payload := protocol.MonitorConfigPayload{
-		Interval: 0,
-		Items:    []protocol.MonitorItem{item},
-	}
-
-	// 向每个目标探针发送
-	for _, agentID := range targetAgentIDs {
-		if err := s.sendMonitorConfigToAgent(agentID, payload); err != nil {
-			if errors.Is(err, ws.ErrClientNotFound) {
-				// 忽略未连接的探针
-			} else {
-				s.logger.Error("发送监控配置失败",
-					zap.String("taskID", monitor.ID),
-					zap.String("taskName", monitor.Name),
-					zap.String("agentID", agentID),
-					zap.Error(err))
-			}
-		}
-	}
-
-	return nil
-}
-
 // GetMonitorStatsByID 获取监控任务的统计数据（聚合后的单个监控详情）
 func (s *MonitorService) GetMonitorStatsByID(ctx context.Context, monitorID string) (*metric.PublicMonitorOverview, error) {
 	// 查询监控任务
@@ -413,8 +334,7 @@ func (s *MonitorService) GetLatestMonitorMetricsByType(ctx context.Context, moni
 	// 在缓存中查询最新的监控数据
 	var result []protocol.MonitorData
 	for _, task := range monitorTasks {
-		monitorData := s.metricService.GetMonitorAgentStats(ctx, task.ID)
-		// 填充监控任务名称
+		monitorData := s.metricService.GetMonitorAgentStatsForTask(ctx, &task)
 		for i := range monitorData {
 			monitorData[i].MonitorName = task.Name
 		}
@@ -424,19 +344,15 @@ func (s *MonitorService) GetLatestMonitorMetricsByType(ctx context.Context, moni
 	return result, nil
 }
 
-// GetAllLatestMonitorMetrics 获取所有最新监控指标（用于告警检查）
 func (s *MonitorService) GetAllLatestMonitorMetrics(ctx context.Context) ([]protocol.MonitorData, error) {
-	// 查询所有最新的监控状态
 	monitorTasks, err := s.FindByEnabled(ctx, true)
 	if err != nil {
 		return nil, err
 	}
 
-	// 在缓存中查询最新的监控数据
 	var result []protocol.MonitorData
 	for _, task := range monitorTasks {
-		monitorData := s.metricService.GetMonitorAgentStats(ctx, task.ID)
-		// 填充监控任务名称
+		monitorData := s.metricService.GetMonitorAgentStatsForTask(ctx, &task)
 		for i := range monitorData {
 			monitorData[i].MonitorName = task.Name
 		}

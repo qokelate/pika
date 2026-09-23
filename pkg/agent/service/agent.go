@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pika-monitor/pika/internal/protocol"
@@ -96,6 +97,8 @@ type Agent struct {
 	outbox           *outbox
 	tamperProtector  *tamper.Protector
 	sshMonitor       *sshmonitor.Monitor
+	monitorRunner    *monitorRunner
+	collecting       atomic.Bool
 }
 
 // New 创建 Agent 实例
@@ -109,6 +112,7 @@ func New(cfg *config.Config) *Agent {
 		outbox:           newOutbox(),
 		tamperProtector:  tamper.NewProtector(),
 		sshMonitor:       sshmonitor.NewMonitor(),
+		monitorRunner:    newMonitorRunner(),
 	}
 }
 
@@ -121,6 +125,7 @@ func (a *Agent) Start(ctx context.Context) error {
 	// 采集与发送解耦：采集永远运行（断线也写快照），发送独立读快照上报
 	go a.collectLoop(ctx)
 	go a.sendLoop(ctx)
+	go a.monitorLoop(ctx)
 	// 安全事件消费属于 Agent 生命周期，而不是单次 WebSocket 连接。
 	// 断线和退避期间仍持续写入 outbox，避免上游小缓冲区溢出丢事件。
 	go a.tamperEventLoop(ctx)
@@ -185,7 +190,7 @@ func (a *Agent) runOnce(ctx context.Context, onRegistered func()) error {
 	dialer := &websocket.Dialer{
 		Proxy:             http.ProxyFromEnvironment,
 		HandshakeTimeout:  45 * time.Second,
-		EnableCompression: true,
+		EnableCompression: false,
 	}
 	if a.cfg.Server.InsecureSkipVerify {
 		dialer.TLSClientConfig = &tls.Config{
@@ -329,19 +334,19 @@ func (a *Agent) readLoop(conn *websocket.Conn, done chan struct{}) error {
 
 		switch msg.Type {
 		case protocol.MessageTypeCommand:
-			go a.handleCommand(msg.Data)
+			go a.goSafe("handleCommand", func() { a.handleCommand(msg.Data) })
 		case protocol.MessageTypeMonitorConfig:
-			go a.handleMonitorConfig(msg.Data)
+			go a.goSafe("handleMonitorConfig", func() { a.handleMonitorConfig(msg.Data) })
 		case protocol.MessageTypeTamperProtect:
-			go a.handleTamperProtect(msg.Data)
+			go a.goSafe("handleTamperProtect", func() { a.handleTamperProtect(msg.Data) })
 		case protocol.MessageTypeDDNSConfig:
-			go a.handleDDNSConfig(msg.Data)
+			go a.goSafe("handleDDNSConfig", func() { a.handleDDNSConfig(msg.Data) })
 		case protocol.MessageTypePublicIPConfig:
-			go a.handlePublicIPConfig(msg.Data)
+			go a.goSafe("handlePublicIPConfig", func() { a.handlePublicIPConfig(msg.Data) })
 		case protocol.MessageTypeSSHLoginConfig:
-			go a.handleSSHLoginConfig(msg.Data)
+			go a.goSafe("handleSSHLoginConfig", func() { a.handleSSHLoginConfig(msg.Data) })
 		case protocol.MessageTypeUninstall:
-			go a.handleUninstall()
+			go a.goSafe("handleUninstall", a.handleUninstall)
 		case protocol.MessageTypeAck:
 			a.handleAck(msg.Data)
 		default:
@@ -494,6 +499,23 @@ func (a *Agent) killConn(conn *safeConn) {
 	_ = conn.Close()
 }
 
+func (a *Agent) goSafe(name string, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("处理协程 panic", "where", name, "panic", r)
+		}
+	}()
+	fn()
+}
+
+func (a *Agent) jitterKey() string {
+	id, err := a.idMgr.Load()
+	if err != nil || id == "" {
+		return a.bootID
+	}
+	return id
+}
+
 func (a *Agent) handleMonitorConfig(data json.RawMessage) {
 	var payload protocol.MonitorConfigPayload
 	if err := json.Unmarshal(data, &payload); err != nil {
@@ -501,29 +523,53 @@ func (a *Agent) handleMonitorConfig(data json.RawMessage) {
 		return
 	}
 
-	if len(payload.Items) == 0 {
-		slog.Info("收到空的服务监控配置，跳过")
-		return
+	oneShot := a.monitorRunner.apply(payload, time.Now(), a.jitterKey())
+	if payload.Replace {
+		slog.Info("更新服务监控任务表", "count", a.monitorRunner.len(), "replace", true)
+	} else if len(payload.Items) > 0 || len(payload.Removed) > 0 {
+		slog.Info("增量更新服务监控任务", "upsert", len(payload.Items), "removed", len(payload.Removed), "total", a.monitorRunner.len())
 	}
 
+	if len(oneShot) > 0 {
+		a.runMonitorItems(oneShot)
+	}
+}
+
+func (a *Agent) monitorLoop(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			a.runMonitorItems(a.monitorRunner.due(now))
+		}
+	}
+}
+
+func (a *Agent) runMonitorItems(items []protocol.MonitorItem) {
+	if len(items) == 0 {
+		return
+	}
 	manager := a.getCollectorManager()
 	if manager == nil {
 		slog.Warn("采集器未就绪，无法执行服务监控任务")
+		for _, item := range items {
+			a.monitorRunner.finish(item.ID)
+		}
 		return
 	}
 
-	slog.Info("收到服务监控配置，立即执行检测", "count", len(payload.Items))
-
-	// 立即执行一次监控检测，结果以单元素 batch 上报。
-	// 走常驻 outbox，断线和版本降级期间也不会绕过队列
-	sample := manager.CollectMonitor(payload.Items)
-	if err := a.sendOutboundMessage(protocol.OutboundMessage{
-		Type: protocol.MessageTypeMetrics,
-		Data: protocol.MetricsBatch{Samples: []protocol.MetricSample{sample}},
-	}); err != nil {
-		slog.Warn("发送监控结果失败", "error", err)
-	} else {
-		slog.Info("服务监控检测完成，已提交监控项结果", "count", len(payload.Items))
+	for _, item := range items {
+		item := item
+		go a.goSafe("runMonitorItem", func() {
+			defer a.monitorRunner.finish(item.ID)
+			a.monitorRunner.acquire()
+			defer a.monitorRunner.release()
+			sample := manager.CollectMonitor([]protocol.MonitorItem{item})
+			a.metricsStore.put([]protocol.MetricSample{sample})
+		})
 	}
 }
 
@@ -589,9 +635,20 @@ func (a *Agent) collectLoop(ctx context.Context) {
 
 // collectOnce 在超时保护下采集本 tick 到期的指标并写入快照存储。
 func (a *Agent) collectOnce(scheduler *metricsScheduler, tickCount uint64) {
+	if !a.collecting.CompareAndSwap(false, true) {
+		slog.Warn("上一轮采集尚未结束，跳过本 tick")
+		return
+	}
+
 	done := make(chan struct{})
 	go func() {
+		defer a.collecting.Store(false)
 		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("采集 panic", "panic", r)
+			}
+		}()
 		samples, hasError := scheduler.collect(tickCount)
 		if len(samples) > 0 {
 			a.metricsStore.put(samples)
@@ -601,9 +658,11 @@ func (a *Agent) collectOnce(scheduler *metricsScheduler, tickCount uint64) {
 		}
 	}()
 
+	timer := time.NewTimer(agentCollectTimeout)
+	defer timer.Stop()
 	select {
 	case <-done:
-	case <-time.After(agentCollectTimeout):
+	case <-timer.C:
 		slog.Warn("数据采集超时", "timeout", agentCollectTimeout)
 	}
 }

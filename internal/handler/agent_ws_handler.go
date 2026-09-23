@@ -28,10 +28,7 @@ func (h *AgentHandler) HandleWebSocket(c *echo.Context) error {
 		return err
 	}
 
-	// 注册探针 - 使用独立的context,不依赖HTTP请求的context
-	h.enabledMu.RLock()
 	agent, err := h.agentService.RegisterAgent(context.Background(), c.RealIP(), &registerReq.AgentInfo, registerReq.ApiKey)
-	h.enabledMu.RUnlock()
 	if err != nil {
 		// 发送注册失败响应
 		h.sendRegisterError(conn, err.Error())
@@ -43,15 +40,15 @@ func (h *AgentHandler) HandleWebSocket(c *echo.Context) error {
 	// AckSeq 与当前连接属于同一次会话切换，旧连接无法在其间污染位点。
 	client := ws.NewClient(agent.ID, conn, h.wsManager)
 	ackSeq := h.wsManager.Register(client, registerReq.BootID)
-	// RegisterAgent 的在线写入发生在连接切换之前，可能被恰好退出的旧连接
-	// 覆盖；会话激活后再确认一次，确保数据库状态属于 current client。
-	if err := h.agentService.UpdateAgentStatus(context.Background(), agent.ID, 1); err != nil {
+	if _, err := h.wsManager.DoIfCurrent(client, func() error {
+		return h.agentService.UpdateAgentStatus(context.Background(), agent.ID, 1)
+	}); err != nil {
 		h.logger.Warn("failed to confirm agent online status", zap.String("agentID", agent.ID), zap.Error(err))
 	}
 	defer func() {
-		if h.wsManager.Unregister(client) {
+		h.wsManager.UnregisterThen(client, func() {
 			h.markAgentOffline(client.ID)
-		}
+		})
 	}()
 
 	// 发送注册成功响应：声明可靠投递支持，并回传该探针的累计确认
@@ -73,10 +70,11 @@ func (h *AgentHandler) HandleWebSocket(c *echo.Context) error {
 			h.logger.Error("failed to send ssh login config", zap.Error(err))
 			// 配置下发失败不中断连接，只记录日志
 		}
-		// 下发公网 IP 采集配置
 		if err := h.sendPublicIPConfig(conn, agent.ID); err != nil {
 			h.logger.Error("failed to send public ip config", zap.Error(err))
-			// 配置下发失败不中断连接，只记录日志
+		}
+		if err := h.sendMonitorConfig(conn, agent.ID); err != nil {
+			h.logger.Error("failed to send monitor config", zap.Error(err))
 		}
 	}
 
@@ -88,9 +86,6 @@ func (h *AgentHandler) HandleWebSocket(c *echo.Context) error {
 
 // handleWebSocketMessage 处理WebSocket消息
 func (h *AgentHandler) handleWebSocketMessage(ctx context.Context, agentID string, messageType string, data json.RawMessage) error {
-	h.enabledMu.RLock()
-	defer h.enabledMu.RUnlock()
-
 	enabled, err := h.agentService.IsAgentEnabled(ctx, agentID)
 	if err != nil {
 		return err
@@ -396,6 +391,22 @@ func (h *AgentHandler) sendPublicIPConfig(conn *websocket.Conn, agentID string) 
 			IPv4APIs:        config.IPv4APIs,
 			IPv6APIs:        config.IPv6APIs,
 		},
+	})
+	if err != nil {
+		return err
+	}
+	return conn.WriteMessage(websocket.TextMessage, msgData)
+}
+
+func (h *AgentHandler) sendMonitorConfig(conn *websocket.Conn, agentID string) error {
+	payload, err := h.monitorSvc.MonitorConfigForAgent(context.Background(), agentID)
+	if err != nil {
+		return err
+	}
+	payload.Replace = true
+	msgData, err := json.Marshal(protocol.OutboundMessage{
+		Type: protocol.MessageTypeMonitorConfig,
+		Data: payload,
 	})
 	if err != nil {
 		return err
