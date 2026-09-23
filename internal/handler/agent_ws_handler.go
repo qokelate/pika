@@ -189,30 +189,7 @@ func (h *AgentHandler) handleMetricsMessage(ctx context.Context, agentID string,
 	if err := json.Unmarshal(data, &batch); err != nil {
 		return ws.Permanent(err)
 	}
-
-	var transientErr error
-	var permanentErr error
-	for _, sample := range batch.Samples {
-		metricsData, err := json.Marshal(sample.Data)
-		if err != nil {
-			h.logger.Warn("failed to marshal metric sample", zap.Error(err))
-			permanentErr = errors.Join(permanentErr, err)
-			continue
-		}
-		if err := h.metricService.HandleMetricData(ctx, agentID, string(sample.Type), metricsData, sample.Timestamp); err != nil {
-			h.logger.Warn("failed to handle metric sample", zap.Error(err), zap.String("type", string(sample.Type)))
-			if isPayloadError(err) {
-				permanentErr = errors.Join(permanentErr, err)
-			} else {
-				transientErr = errors.Join(transientErr, err)
-			}
-			continue
-		}
-	}
-	if transientErr != nil {
-		return transientErr
-	}
-	return ws.Permanent(permanentErr)
+	return classifyMessageError(h.metricService.HandleMetricsBatch(ctx, agentID, batch.Samples))
 }
 
 func (h *AgentHandler) handleCommandResponseMessage(ctx context.Context, agentID string, data json.RawMessage) error {

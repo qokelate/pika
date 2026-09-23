@@ -4,12 +4,29 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
+	"sync/atomic"
 	"time"
 )
+
+const (
+	httpMaxIdleConns        = 128
+	httpMaxIdleConnsPerHost = 32
+	httpMaxConnsPerHost     = 32
+
+	writeBatchMaxMetrics = 2000
+	writeBatchMaxWait    = 50 * time.Millisecond
+	writeQueueSize       = 1024
+	writeWorkers         = 4
+	maxResponseBody      = 8 << 20
+)
+
+var errClientClosed = errors.New("victoria metrics client closed")
 
 // VMClient VictoriaMetrics 客户端
 type VMClient struct {
@@ -17,6 +34,17 @@ type VMClient struct {
 	httpClient   *http.Client
 	writeTimeout time.Duration
 	queryTimeout time.Duration
+
+	writeCh   chan writeRequest
+	stopCh    chan struct{}
+	stopped   atomic.Bool
+	writeOnce sync.Once
+	wg        sync.WaitGroup
+}
+
+type writeRequest struct {
+	metrics []Metric
+	result  chan error
 }
 
 // QueryResult 查询结果
@@ -60,18 +88,163 @@ func NewVMClient(baseURL string, writeTimeout, queryTimeout time.Duration) *VMCl
 		queryTimeout = 60 * time.Second
 	}
 
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = httpMaxIdleConns
+	transport.MaxIdleConnsPerHost = httpMaxIdleConnsPerHost
+	transport.MaxConnsPerHost = httpMaxConnsPerHost
+
 	return &VMClient{
 		baseURL: baseURL,
 		httpClient: &http.Client{
-			Timeout: writeTimeout, // 默认超时
+			Transport: transport,
 		},
 		writeTimeout: writeTimeout,
 		queryTimeout: queryTimeout,
+		writeCh:      make(chan writeRequest, writeQueueSize),
+		stopCh:       make(chan struct{}),
 	}
 }
 
-// Write 写入指标（VictoriaMetrics JSON Line Format）
+// Write 写入指标（VictoriaMetrics JSON Line Format）。
+// 多个并发 Write 会在短窗口内合并成一次 HTTP POST，避免 1000 探针
+// 各自建连把本机 ephemeral port / conntrack 打满。
 func (c *VMClient) Write(ctx context.Context, metrics []Metric) error {
+	if len(metrics) == 0 {
+		return nil
+	}
+	c.startWriter()
+
+	result := make(chan error, 1)
+	req := writeRequest{metrics: metrics, result: result}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.stopCh:
+		return errClientClosed
+	case c.writeCh <- req:
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-result:
+		return err
+	}
+}
+
+// Close 停止后台写入合并协程。生产进程无需调用；测试在 Write 完成后关闭。
+func (c *VMClient) Close() {
+	if c.stopped.CompareAndSwap(false, true) {
+		close(c.stopCh)
+	}
+	c.wg.Wait()
+}
+
+func (c *VMClient) startWriter() {
+	c.writeOnce.Do(func() {
+		c.wg.Add(1)
+		go c.runWriter()
+	})
+}
+
+func (c *VMClient) runWriter() {
+	defer c.wg.Done()
+
+	sem := make(chan struct{}, writeWorkers)
+	var inflight sync.WaitGroup
+	defer inflight.Wait()
+
+	var pending []writeRequest
+	pendingMetrics := 0
+	timer := time.NewTimer(writeBatchMaxWait)
+	defer timer.Stop()
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timerRunning := false
+
+	stopTimer := func() {
+		if !timerRunning {
+			return
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timerRunning = false
+	}
+
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+		batch := pending
+		pending = nil
+		pendingMetrics = 0
+		stopTimer()
+
+		inflight.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer func() {
+				<-sem
+				inflight.Done()
+			}()
+			c.flushBatch(batch)
+		}()
+	}
+
+	for {
+		select {
+		case req := <-c.writeCh:
+			pending = append(pending, req)
+			pendingMetrics += len(req.metrics)
+			if pendingMetrics >= writeBatchMaxMetrics {
+				flush()
+			} else if !timerRunning {
+				timer.Reset(writeBatchMaxWait)
+				timerRunning = true
+			}
+		case <-timer.C:
+			timerRunning = false
+			flush()
+		case <-c.stopCh:
+			for {
+				select {
+				case req := <-c.writeCh:
+					pending = append(pending, req)
+					pendingMetrics += len(req.metrics)
+				default:
+					flush()
+					return
+				}
+			}
+		}
+	}
+}
+
+func (c *VMClient) flushBatch(batch []writeRequest) {
+	total := 0
+	for _, req := range batch {
+		total += len(req.metrics)
+	}
+	metrics := make([]Metric, 0, total)
+	for _, req := range batch {
+		metrics = append(metrics, req.metrics...)
+	}
+
+	err := c.writeDirect(context.Background(), metrics)
+	for _, req := range batch {
+		req.result <- err
+	}
+}
+
+func (c *VMClient) writeDirect(ctx context.Context, metrics []Metric) error {
 	if len(metrics) == 0 {
 		return nil
 	}
@@ -79,7 +252,6 @@ func (c *VMClient) Write(ctx context.Context, metrics []Metric) error {
 	reqCtx, cancel := context.WithTimeout(ctx, c.writeTimeout)
 	defer cancel()
 
-	// 将 Metric 数组转换为 JSON Line Format (NDJSON)
 	var buf bytes.Buffer
 	encoder := json.NewEncoder(&buf)
 	for _, metric := range metrics {
@@ -88,25 +260,34 @@ func (c *VMClient) Write(ctx context.Context, metrics []Metric) error {
 		}
 	}
 
-	req, err := http.NewRequestWithContext(reqCtx, "POST", c.baseURL+"/api/v1/import", &buf)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.baseURL+"/api/v1/import", &buf)
 	if err != nil {
 		return fmt.Errorf("create request failed: %w", err)
 	}
-
 	req.Header.Set("Content-Type", "application/x-ndjson")
 
-	resp, err := c.httpClient.Do(req)
+	status, body, err := c.do(req)
 	if err != nil {
 		return fmt.Errorf("write metrics failed: %w", err)
 	}
+	if status != http.StatusNoContent && status != http.StatusOK {
+		return fmt.Errorf("write metrics failed with status %d: %s", status, string(body))
+	}
+	return nil
+}
+
+func (c *VMClient) do(req *http.Request) (int, []byte, error) {
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("write metrics failed with status %d: %s", resp.StatusCode, string(body))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+	if err != nil {
+		return resp.StatusCode, nil, err
 	}
-
-	return nil
+	return resp.StatusCode, body, nil
 }
 
 // AutoStep 根据查询范围自动生成 step（适用于 VictoriaMetrics）
@@ -156,32 +337,26 @@ func (c *VMClient) QueryRange(ctx context.Context, query string, start, end time
 	}
 
 	reqURL := fmt.Sprintf("%s/api/v1/query_range?%s", c.baseURL, params.Encode())
-
-	req, err := http.NewRequestWithContext(reqCtx, "GET", reqURL, nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request failed: %w", err)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	status, body, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("query range failed: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("query range failed with status %d: %s", resp.StatusCode, string(body))
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("query range failed with status %d: %s", status, string(body))
 	}
 
 	var result QueryResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("decode response failed: %w", err)
 	}
-
 	if result.Status != "success" {
 		return nil, fmt.Errorf("query failed with status: %s", result.Status)
 	}
-
 	return &result, nil
 }
 
@@ -192,34 +367,28 @@ func (c *VMClient) Query(ctx context.Context, query string) (*QueryResult, error
 
 	params := url.Values{}
 	params.Set("query", query)
-
 	reqURL := fmt.Sprintf("%s/api/v1/query?%s", c.baseURL, params.Encode())
 
-	req, err := http.NewRequestWithContext(reqCtx, "GET", reqURL, nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request failed: %w", err)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	status, body, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("query failed: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("query failed with status %d: %s", resp.StatusCode, string(body))
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("query failed with status %d: %s", status, string(body))
 	}
 
 	var result QueryResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("decode response failed: %w", err)
 	}
-
 	if result.Status != "success" {
 		return nil, fmt.Errorf("query failed with status: %s", result.Status)
 	}
-
 	return &result, nil
 }
 
@@ -243,17 +412,13 @@ func (c *VMClient) DeleteSeries(ctx context.Context, matchers []string) error {
 		return fmt.Errorf("create request failed: %w", err)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	status, body, err := c.do(req)
 	if err != nil {
 		return fmt.Errorf("delete series failed: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("delete series failed with status %d: %s", resp.StatusCode, string(body))
+	if status != http.StatusOK && status != http.StatusNoContent {
+		return fmt.Errorf("delete series failed with status %d: %s", status, string(body))
 	}
-
 	return nil
 }
 
@@ -270,13 +435,11 @@ func ConvertToDataPoints(result *QueryResult) []DataPoint {
 				continue
 			}
 
-			// timestamp 是 float64（Unix 秒）
 			timestamp, ok := v[0].(float64)
 			if !ok {
 				continue
 			}
 
-			// value 是 string
 			valueStr, ok := v[1].(string)
 			if !ok {
 				continue
@@ -288,7 +451,7 @@ func ConvertToDataPoints(result *QueryResult) []DataPoint {
 			}
 
 			points = append(points, DataPoint{
-				Timestamp: int64(timestamp * 1000), // 转换为毫秒
+				Timestamp: int64(timestamp * 1000),
 				Value:     value,
 				Labels:    r.Metric,
 			})
@@ -309,35 +472,28 @@ func (c *VMClient) GetLabelValues(ctx context.Context, labelName string, match [
 	}
 
 	reqURL := fmt.Sprintf("%s/api/v1/label/%s/values?%s", c.baseURL, labelName, params.Encode())
-
-	req, err := http.NewRequestWithContext(reqCtx, "GET", reqURL, nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request failed: %w", err)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	status, body, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("get label values failed: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("get label values failed with status %d: %s", resp.StatusCode, string(body))
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("get label values failed with status %d: %s", status, string(body))
 	}
 
 	var result struct {
 		Status string   `json:"status"`
 		Data   []string `json:"data"`
 	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("decode response failed: %w", err)
 	}
-
 	if result.Status != "success" {
 		return nil, fmt.Errorf("get label values failed with status: %s", result.Status)
 	}
-
 	return result.Data, nil
 }
