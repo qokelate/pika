@@ -5,7 +5,9 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"runtime"
@@ -22,6 +24,7 @@ import (
 	"github.com/pika-monitor/pika/pkg/agent/sshmonitor"
 	"github.com/pika-monitor/pika/pkg/agent/tamper"
 	"github.com/pika-monitor/pika/pkg/version"
+	"github.com/xtaci/kcp-go/v5"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -189,8 +192,18 @@ func (a *Agent) runOnce(ctx context.Context, onRegistered func()) error {
 	// 创建自定义的 Dialer
 	dialer := &websocket.Dialer{
 		Proxy:             http.ProxyFromEnvironment,
-		HandshakeTimeout:  45 * time.Second,
+		HandshakeTimeout:  5 * time.Second,
 		EnableCompression: false,
+
+		NetDial: func(network, addr string) (net.Conn, error) {
+			conn, err := kcp.Dial(addr)
+			if err != nil {
+				log.Println(err.Error())
+				return nil, err
+			}
+
+			return conn, err
+		},
 	}
 	if a.cfg.Server.InsecureSkipVerify {
 		dialer.TLSClientConfig = &tls.Config{

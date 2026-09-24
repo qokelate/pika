@@ -16,6 +16,7 @@ import (
 	"github.com/pika-monitor/pika/internal/scheduler"
 	"github.com/pika-monitor/pika/internal/service"
 	"github.com/pika-monitor/pika/pkg/version"
+	"github.com/xtaci/kcp-go/v5"
 
 	"github.com/go-errors/errors"
 	"github.com/go-orz/orz"
@@ -173,6 +174,29 @@ func setupApi(app *orz.App, components *AppComponents) error {
 
 	// WebSocket 路由（探针连接）
 	e.GET("/ws/agent", components.AgentHandler.HandleWebSocket)
+
+	//by sma11case, 启动 kcp server
+	go func() {
+		a := app.GetConfig()
+		logger.Info(`启动KCP监听 ` + a.Server.Addr)
+		listener, err := kcp.Listen(a.Server.Addr)
+		if err != nil {
+			logger.Error("kcp 监听失败", zap.Error(err))
+			return
+		}
+
+		mux := &http.ServeMux{}
+		mux.HandleFunc(`/ws/agent`, components.AgentHandler.HandleWebSocket2)
+
+		hh := &http.Server{
+			Handler: mux,
+		}
+		err = hh.Serve(listener)
+		if err != nil {
+			logger.Error("kcp 服务已关闭", zap.Error(err))
+			return
+		}
+	}()
 
 	// 管理员 API 路由（需要认证，支持 JWT Token 或 API Key）
 	adminApi := e.Group("/api/admin")
