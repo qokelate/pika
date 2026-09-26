@@ -9,6 +9,7 @@ import (
 	"github.com/go-orz/orz"
 	"github.com/pika-monitor/pika/internal"
 	"github.com/pika-monitor/pika/internal/config"
+	"github.com/pika-monitor/pika/internal/database"
 	v0_0_13 "github.com/pika-monitor/pika/internal/migrate/v0_0_13"
 	"github.com/pika-monitor/pika/internal/vmclient"
 	"github.com/spf13/cobra"
@@ -79,6 +80,9 @@ func runMigration(configPath string) {
 	err := orz.Quick(configPath, func(app *orz.App) error {
 		logger = app.Logger()
 		db = app.GetDatabase()
+		if err := database.ConfigureConnectionPool(db, logger); err != nil {
+			return err
+		}
 
 		// 读取 VictoriaMetrics 配置
 		var appConfig config.AppConfig

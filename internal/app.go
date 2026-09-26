@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/pika-monitor/pika/internal/assets"
 	"github.com/pika-monitor/pika/internal/config"
+	"github.com/pika-monitor/pika/internal/database"
 	"github.com/pika-monitor/pika/internal/handler"
 	"github.com/pika-monitor/pika/internal/migrate"
 	"github.com/pika-monitor/pika/internal/models"
@@ -35,6 +36,10 @@ func Run(configPath string) {
 }
 
 func setup(app *orz.App) error {
+	if err := database.ConfigureConnectionPool(app.GetDatabase(), app.Logger()); err != nil {
+		return err
+	}
+
 	// 数据库迁移
 	if err := autoMigrate(app.GetDatabase()); err != nil {
 		return err

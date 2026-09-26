@@ -38,6 +38,8 @@ database:
 
 **注意**：如果修改了 `docker-compose.postgresql.yml` 中的数据库密码（`POSTGRES_PASSWORD`），也需要同步修改 `config.yaml` 中的数据库密码。
 
+服务端使用共享数据库连接池处理所有探针请求，PostgreSQL 默认最多保持 64 个打开连接、16 个空闲连接；连接空闲 5 分钟或存活 30 分钟后会自动回收，不会按探针数量创建一一对应的数据库连接。
+
 其他配置项请参考 [通用配置说明](common-config.md)。
 
 ### 3. 启动服务
